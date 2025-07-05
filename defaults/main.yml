@@ -1,0 +1,80 @@
+---
+# defaults file for podman
+
+# If youd like to run rootless containers
+podman_rootless: True
+# If rootless is enabled, configure a cronjob that setups subuid/subgid for evey user
+podman_rootless_cron: True
+# Specify which users shall linger. Leave empty for automatic
+# A note: if you want to give your users proper logging you need to set storage=persistent in your journal config
+podmann_rootless_linger: []
+
+# If youd like to have the docker-compat-socket enabled
+podman_socket: True
+
+# Quadlet Configuration
+## Parameters:
+## quadlet_options: 
+##  - |
+##    [Install]
+##    WantedBy=default.target
+
+podman_container_quadlets:
+# galera example
+  data:
+    image: registry.in.strato.de/webgods/container/percona:5.7 # image to run
+    user: "3307" # which users uid to run inside the container 
+    network: data # which overlay_network this container connects to
+    pull: never # missing|always|never|newer
+    ports:
+      - 3307:3306
+    env:
+      MYSQL_ROOT_PASSWORD: "{{ vault_podman_galera_instances_data_sql_user_root }}"
+      CLUSTER_NAME: "cluster"
+      MYSQL_USER: "data"
+    volumes:
+      - "/mysql/data/datadir:/var/lib/mysql"
+      - "/mysql/data/config:/etc/mysql"
+      - "/etc/mysql/ssl:/cert"
+      - "/mysql/data/tmp:/tmp"
+
+
+# In general you can keep this as is.    
+quadlet_default_options:
+  - "AutoUpdate=registry"
+  - |
+    [Install]
+    WantedBy=default.target
+#  - |
+#    [Service]
+#    Environment=HTTP_PROXY={{yum_proxy}}
+#    Environment=HTTPS_PROXY={{yum_proxy}}
+
+podman_packages:
+  - podman
+  - podman-docker
+  - systemd-container
+
+# If you dont want the containers to start or restart
+podman_start_container: True
+
+### overlay network ###
+
+podman_networking_packages:
+  - bridge-utils
+  - jq
+  - kernel-modules
+
+podman_ovs_packages:
+  - openvswitch-selinux-extra-policy
+  - openvswitch3.1
+
+podman_overlay_networks:
+    data: # network name (keep it short: 9 char max)
+    net_prefix: "10.89." # prefix for the network
+    net_id: "10" # ends up in container IP/network AND as a key for the geneve tunnel
+    opt: "mtu=1450"
+    hosts: "galera.podman" # hostgroup
+    iface: "eth0"
+    static_ip: True # ip will look like: {{net_prefix}}{{net_id}}.1<index in group>1
+

@@ -1,0 +1,139 @@
+---
+
+- name: get the used bridge
+  shell: "podman network inspect {{podman_network_key}} | jq -r '.[]|.network_interface'"
+  register: podman_bridge
+  check_mode: false
+
+
+- debug:
+    msg: "PODMAN BRIDGE:{{ podman_bridge.stdout }}"
+
+
+- name: make sure podman bridge is added and up
+  shell: "brctl addbr {{podman_bridge.stdout}}; ip link set {{podman_bridge.stdout}} up"
+
+
+- name: register if veth is already up
+  shell: "nmcli  connection show | grep {{podman_network_key}}-veth0 | awk '{print $1}'"
+  register: instance_veth
+  check_mode: false
+  ignore_errors: true
+
+
+- debug:
+    msg: "EXISTING VETH: {{instance_veth.stdout}}"
+
+
+- name: add veth
+  shell: "nmcli connection add type veth con-name {{podman_network_key}}-veth0 ifname {{podman_network_key}}-veth0 veth.peer {{podman_network_key}}-veth1"
+  when: instance_veth.stdout == ''
+
+
+- name: register if veth is already added to bridge
+  shell: "brctl show | grep {{podman_network_key}}-veth0"
+  register: veth_added
+  check_mode: false
+  ignore_errors: true
+
+
+- debug:
+    msg: "EXISTING BRIDGE: {{veth_added.stdout}}"
+
+
+- name: link veth to podman bridge
+  shell: "brctl addif {{podman_bridge.stdout}} {{podman_network_key}}-veth0"
+  when: veth_added.stdout == ''
+
+
+- name: set ovs bridge name
+  set_fact:
+    ovs_bridge_name: "ovs-br-{{podman_network_key}}"
+
+
+- debug:
+    msg: "BRIDGE NAME: {{ovs_bridge_name}}"
+
+
+- name: LOOK AT MEE IF THE NEXT TASK FAILS
+  debug: 
+    msg: "Bridge name {{ovs_bridge_name}} to long"
+  when: ovs_bridge_name | length > 15
+
+
+- name: create ovs bridge
+  openvswitch.openvswitch.openvswitch_bridge:
+    bridge: "{{ovs_bridge_name}}"
+    state: present
+
+
+- name: add veth1 to ovs bridge
+  openvswitch.openvswitch.openvswitch_port:
+    bridge: "{{ovs_bridge_name}}"
+    port: "{{podman_network_key}}-veth1"
+    state: present
+
+
+- name: turn veths interfaces up
+  shell: "ip link set {{podman_network_key}}-{{item}} up"
+  with_items:
+    - "veth1"
+    - "veth0"
+
+
+- name: Gather facts from ALL hosts (regardless of limit or tags)
+  setup:
+    filter:
+      -  "ansible_{{podman_network_cur['iface']}}"
+  delegate_to: "{{ item }}"
+  delegate_facts: True
+  when: hostvars[item]['ansible_' ~ podman_network_cur['iface']]['ipv4']['address'] is not defined
+  loop: "{{ groups[podman_network_cur['hosts']] }}"
+
+
+- name: Add hosts ips to list
+  set_fact:
+    podman_host_ips: | 
+      {% set member_ips = [] %}
+      {%- for host in groups[podman_network_cur['hosts']] -%}
+      {%- if host != inventory_hostname -%}
+      {{member_ips.append(hostvars[host]['ansible_' ~ podman_network_cur['iface']]['ipv4']['address'])}}
+      {%- endif -%}
+      {%- endfor -%}
+      {{member_ips}}
+
+- name: Add hostnames to list
+  set_fact:
+    podman_host_names: | 
+      {% set member_names = [] %}
+      {%- for host in groups[podman_network_cur['hosts']] -%}
+      {%- if host != inventory_hostname -%}
+      {{member_names.append(hostvars[host]['inventory_hostname_short'])}}
+      {%- endif -%}
+      {%- endfor -%}
+      {{member_names}}
+
+
+- debug:
+    msg: "podman_host_names: {{podman_host_names}}\npodman_host_ips: {{podman_host_ips}}"
+
+
+- name: OVS command that will be executed in the next task
+  debug:
+    msg: "ovs-vsctl add-port {{ovs_bridge_name}} to_{{podman_network_key}}_{{item.0}} -- set interface to_{{podman_network_key}}_{{item.0}} type=geneve options:remote_ip={{item.1}} options:key={{podman_network_cur['net_id']}}"
+  loop: "{{ podman_host_names | zip(podman_host_ips) | list }}"
+
+
+- name: create geneve tunnels
+  openvswitch.openvswitch.openvswitch_port:
+    bridge: "{{ovs_bridge_name}}"
+    port: "to_{{podman_network_key}}_{{item.0}}"
+    set: "interface to_{{podman_network_key}}_{{item.0}} type=geneve options:remote_ip={{item.1}} options:key={{podman_network_cur['net_id']}}"
+    state: present
+  loop: "{{ podman_host_names | zip(podman_host_ips) | list }}"
+
+
+- name: set ovs interface up
+  shell: "ip link set {{ovs_bridge_name}} up"
+
+ 

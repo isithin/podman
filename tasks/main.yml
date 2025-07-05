@@ -1,0 +1,138 @@
+---
+# tasks file for podman
+
+- name: include user tasks
+  include_tasks: "rootless.yml"
+  when: 
+     - podman_rootless is defined and podman_rootless
+
+- name: install podman and deps
+  dnf:
+    name: "{{podman_packages}}"
+    state: installed
+
+- name: manage podman socket state
+  service:
+    name: podman
+    state: "{{state}}"
+    enabled: "{{enabled}}"
+  vars:
+    state: "{{ (podman_socket is defined and podman_socket) | ternary('started', 'stopped')}}"
+    enabled: "{{ (podman_socket is defined and podman_socket) | ternary('yes', 'no')}}"
+
+- name: figure out which networks we need
+  set_fact:
+    podman_quadlet_networks: "{{podman_container_quadlets|dict2items|json_query(qry)|unique|list}}"
+  vars:
+    qry: '[*].value.network'
+
+- name: figure out which users we need to linger
+  set_fact:
+    podman_user_linger: "{{podman_container_quadlets|dict2items|json_query(qry)|unique|list}}"
+  vars:
+    qry: '[*].value.user_run_as'
+  when:
+    - podman_user_linger is not defined or not podman_user_linger 
+
+- name: get lingering users
+  ansible.builtin.find:
+    paths: /var/lib/systemd/linger/
+    file_type: file
+  register: podman_r_lingerfiles
+
+- name: setup linger for requested users
+  command: "loginctl enable-linger {{item}}" 
+  loop: "{{podman_user_linger|difference(lingerfiles)}}"
+  vars:
+    lingerfiles: "{{podman_r_lingerfiles['files']|map(attribute='path')|map('basename')|list}}"
+
+
+- name: include per-quadlet tasks
+  include_tasks: quadlet.yml
+  loop: "{{podman_container_quadlets|dict2items}}"
+  vars:
+    podman_cur: "{{podman_quadlet['value']}}"
+    podman_key: "{{podman_quadlet['key']}}"
+  loop_control:
+    loop_var: podman_quadlet
+    label: "{{ podman_quadlet['key'] }}"
+  when:
+    - podman_container_quadlets is defined and podman_container_quadlets
+
+- debug:
+    var: podman_quadlet_units_changed
+
+- debug:
+    var: podman_quadlet_network_units_changed
+
+- name: issue a (re) start for networks of 
+  ansible.builtin.systemd:
+    daemon_reload: yes
+    scope: "{{item['become'] | ternary('user', omit)}}"
+    name: "{{item['key']}}"
+    state: "restarted"
+  become: "{{item['become']}}"
+  become_user: "{{item['become_user']}}"
+  become_method: "machinectl"
+  when:
+    - podman_quadlet_network_units_changed is defined and podman_quadlet_network_units_changed
+  loop: "{{podman_quadlet_network_units_changed}}"
+  vars:
+    ansible_ssh_pipelining: no
+  register: podman_r_restart
+
+- name: issue a (re) start for all changed containers
+  ansible.builtin.systemd:
+    daemon_reload: yes
+    scope: "{{item['become'] | ternary('user', omit)}}"
+    name: "{{item['key']}}"
+    state: "restarted"
+  become: "{{item['become']}}"
+  become_user: "{{item['become_user']}}"
+  become_method: "machinectl"
+  when:
+    - podman_quadlet_units_changed is defined and podman_quadlet_units_changed
+    - podman_start_container
+  loop: "{{podman_quadlet_units_changed}}"
+  vars:
+    ansible_ssh_pipelining: no
+  register: podman_r_restart
+
+
+- name: configure overlay network
+  # noch doof, weil er es beim galera run für jede instanz macht...
+  when: podman_overlay_networks is defined and podman_overlay_networks  
+  block:
+
+    - name: install podman networking packages and deps
+      dnf:
+        name: "{{podman_networking_packages}}"
+        state: installed
+
+    - name: install ovs packages
+      dnf:
+        name: "{{podman_ovs_packages}}"
+        state: installed
+
+    - name: start and enable ovs
+      service:
+        name: openvswitch
+        state: started
+        enabled: yes
+      register: ovs_installation
+    
+    - name: restart nm
+      service:
+        name: NetworkManager
+        state: restarted
+      when: ovs_installation.changed
+
+    - name: include per-overlay-network tasks
+      include_tasks: overlay_network.yml
+      loop: "{{podman_overlay_networks|dict2items}}"
+      vars:
+        podman_network_cur: "{{podman_network['value']}}"
+        podman_network_key: "{{podman_network['key']}}"
+      loop_control:
+        loop_var: podman_network
+        label: "{{ podman_network['key'] }}"

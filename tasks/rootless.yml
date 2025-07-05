@@ -1,0 +1,37 @@
+---
+
+- name: read remote configuration
+  command: sysctl -n user.max_user_namespaces
+  register: podman_r_max_user_namespaces
+  changed_when: False
+  check_mode: False
+
+- name: error out if we are not configured for user-namespaces
+  fail:
+    msg: "Your System is not configured for rootless containers. use the sysctl role to set max_user_namespaces > 1500. (Now: {{_value}})"
+  vars:
+    _value: "{{podman_r_max_user_namespaces['stdout'] | int}}"
+  when:
+    - _value|int < 1500
+
+- name: deploy cron script to remote host
+  copy:
+    src: "files/rz_containeruidmaps.sh"
+    dest: "/usr/local/bin/rz_containeruidmaps.sh"
+    mode: '0744'
+
+- name: setup subuid/subgid crons
+  include_role:
+    name: "cron"
+  vars:
+    cron_details:
+      rz_subids:
+        rz_subids:
+          minute: "*"
+          hour: "*"
+          day: "*"
+          weekday: "*"
+          month: "*"
+          user: "root"
+          job: '/usr/local/bin/rz_containeruidmaps.sh'
+

@@ -1,0 +1,123 @@
+---
+
+- name: "Set net prefix and id as fact for better readability"
+  set_fact:
+    net_prefix: "{{podman_overlay_networks[podman_cur['network']]['net_prefix']}}"
+    net_id: "{{podman_overlay_networks[podman_cur['network']]['net_id']}}"
+  when:
+    - podman_overlay_networks[podman_cur['network']] is defined
+
+
+- name: "Set static container IP"
+  set_fact:
+    container_ip: >-
+      {%- set host_index_in_group = groups[podman_overlay_networks[podman_cur['network']]['hosts']].index(inventory_hostname) -%}
+      {{net_prefix}}{{net_id}}.1{{host_index_in_group}}1
+  when: 
+    - podman_overlay_networks[podman_cur['network']]['static_ip'] is defined
+
+
+- name: "Set IP Range and subnet for podman network"
+  set_fact:
+    container_ip_range: |
+      {% set host_index_in_group = groups[podman_overlay_networks[podman_cur['network']]['hosts']].index(inventory_hostname) %}
+      {{net_prefix}}{{net_id}}.1{{host_index_in_group}}0-{{net_prefix}}{{net_id}}.1{{host_index_in_group}}9
+    subnet: "{{net_prefix}}{{net_id}}.0/24"
+  when: 
+    - podman_overlay_networks[podman_cur['network']] is defined
+
+
+- debug:
+        msg: "CONTAINER-IP: {{container_ip|default('not static')}}\nIP-RANGE: {{container_ip_range}}\nSUBNET: {{subnet}}" 
+  when: 
+    - podman_overlay_networks[podman_cur['network']] is defined
+
+
+- name: "Create Quadlet file for podman network {{podman_cur['network']}}"
+  containers.podman.podman_network:
+    name: "{{podman_cur['network']}}"
+    subnet: "{{subnet|default(omit)}}"
+    ip_range: "{{container_ip_range|default(omit)}}"
+    opt: "{{podman_overlay_networks[podman_cur['network']]['opt']|default(omit)}}"
+    state: quadlet
+  become: "{{ ( 'user_run_as' in podman_cur) | ternary(true, false) }}"
+  become_user: "{{ ('user_run_as' in podman_cur) | ternary(podman_cur['user_run_as'],'root')}}"
+  when:
+    - ('network' in podman_cur)
+  register: podman_r_quadlet_network
+
+
+- name: "pull the image {{podman_cur['image']}}"
+  containers.podman.podman_image:
+    name: "{{podman_cur['image']}}"
+  become: "{{( 'user_run_as' in podman_cur) | ternary(true, false)}}"
+  become_user: "{{('user_run_as' in podman_cur) | ternary(podman_cur['user_run_as'],'root')}}"
+  become_method: "machinectl" # we need an interactive session, sudo cant handle this
+  vars:
+    isUser: "{{ ('user_run_as' in podman_cur) | ternary('--user', '') }}"
+    ansible_ssh_pipelining: no
+    yum_proxy: "{{ default_networks[rz_network_key]['proxy']|default('') }}"
+  environment:
+    http_proxy: "{{yum_proxy}}"
+    https_proxy: "{{yum_proxy}}"
+    
+
+- name: "configure quadlet {{podman_key}}"
+  containers.podman.podman_container:
+    name: "{{podman_key}}"
+    image: "{{podman_cur['image']}}"
+    state: quadlet
+    quadlet_filename: "{{podman_key}}"
+    hostname: "{{('hostname' in podman_cur) | ternary(podman_cur['hostname'], omit)}}"
+    ip: "{{container_ip|default(omit)}}" 
+    user: "{{('user' in podman_cur) | ternary(podman_cur['user'], omit)}}"
+    network: "{{('network' in podman_cur) | ternary(podman_cur['network'] + '.network', omit)}}"
+    pull: "{{('pull' in podman_cur) | ternary(podman_cur['pull'], 'always')}}"
+    env: "{{('env' in podman_cur) | ternary(podman_cur['env'], omit)}}"
+    ports: "{{('ports' in podman_cur) | ternary(podman_cur['ports'], omit)}}"
+    volumes: "{{('volumes' in podman_cur) | ternary(podman_cur['volumes'], omit)}}"
+    http_proxy: "{{('http_proxy' in podman_cur) | ternary(podman_cur['http_proxy'], omit)}}"
+    userns: 'keep-id'
+    healthcheck: "{{('healthcheck' in podman_cur) | ternary(podman_cur['healthcheck'], omit)}}"
+    healthcheck_failure_action: "{{('healthcheck_failure_action' in podman_cur) | ternary(podman_cur['healthcheck_failure_action'], omit)}}"
+    quadlet_options: "{{ ('quadlet_options' in podman_cur and podman_cur['quadlet_options']) | ternary(podman_cur['quadlet_options'], quadlet_default_options) }}"
+  become: "{{( 'user_run_as' in podman_cur) | ternary(true, false)}}"
+  become_user: "{{('user_run_as' in podman_cur) | ternary(podman_cur['user_run_as'],'root')}}"
+  vars:
+    yum_proxy: "{{ default_networks[rz_network_key]['proxy']|default('') }}"
+  register: podman_r_quadlet
+
+
+- name: regenerate transient container unit files
+  command: "systemctl {{isUser}} daemon-reload"
+  become: "{{( 'user_run_as' in podman_cur) | ternary(true, false)}}"
+  become_user: "{{('user_run_as' in podman_cur) | ternary(podman_cur['user_run_as'],'root')}}"
+  become_method: "machinectl" # we need an interactive session, sudo cant handle this
+  vars:
+    isUser: "{{ ('user_run_as' in podman_cur) | ternary('--user', '') }}"
+    ansible_ssh_pipelining: no
+  when: 
+    - podman_r_quadlet is changed
+
+
+- name: save the changed units for later
+  set_fact:
+    podman_quadlet_units_changed: "{{podman_quadlet_units_changed|default([]) + [changedunit] }}"
+  vars:
+    changedunit:
+      key: "{{podman_key}}"
+      become: "{{( 'user_run_as' in podman_cur) | ternary(true, false)}}"
+      become_user: "{{('user_run_as' in podman_cur) | ternary(podman_cur['user_run_as'],'root')}}"
+  when:
+    - podman_r_quadlet is changed
+
+- name: save the changed network units for later
+  set_fact:
+    podman_quadlet_network_units_changed: "{{podman_quadlet_network_units_changed|default([]) + [changedunit] }}"
+  vars:
+    changedunit:
+      key: "{{podman_key}}-network"
+      become: "{{( 'user_run_as' in podman_cur) | ternary(true, false)}}"
+      become_user: "{{('user_run_as' in podman_cur) | ternary(podman_cur['user_run_as'],'root')}}"
+  when:
+    - podman_r_quadlet_network is changed
